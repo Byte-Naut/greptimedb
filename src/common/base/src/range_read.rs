@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod batch;
+mod plan;
+
 use std::future::Future;
 use std::io;
 use std::ops::Range;
@@ -27,6 +30,9 @@ use futures::AsyncRead;
 use pin_project::pin_project;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio::sync::Mutex;
+
+pub use self::batch::{BatchConfig, BatchEvent, BatchReader, ReadQueue};
+pub use self::plan::{ReadPlan, ReadSlice};
 
 /// `Metadata` contains the metadata of a source.
 pub struct Metadata {

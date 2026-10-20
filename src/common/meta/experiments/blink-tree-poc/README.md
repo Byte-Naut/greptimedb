@@ -1,0 +1,26 @@
+# In-place B-link tree and transaction recovery experiment
+
+This standalone, test-only Rust crate exercises object-level CAS, recoverable leaf splits, and cross-leaf transaction visibility. All implementation and regression tests are in `src/lib.rs` (597 lines, including the license header). It is an independent nested Cargo workspace and does not register a backend, alter GreptimeDB metadata, or build the service dependency graph.
+
+Run from the repository root in WSL with the pinned Rust toolchain:
+
+```sh
+cargo test --locked --offline --manifest-path src/common/meta/experiments/blink-tree-poc/Cargo.toml
+cargo nextest run --locked --offline --manifest-path src/common/meta/experiments/blink-tree-poc/Cargo.toml
+cargo clippy --locked --offline --manifest-path src/common/meta/experiments/blink-tree-poc/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path src/common/meta/experiments/blink-tree-poc/Cargo.toml -- --check
+```
+
+OpenDAL 0.59.4 Memory implements `write_with(...).if_not_exists(true)`, but its capability advertises no conditional overwrite (`if_match`) or native ETag. `CasStore::if_match` therefore **simulates** this primitive with a shared per-object async mutex and an envelope containing a monotonically increasing version and the JSON payload. Clients share the wrapper; the mutex is released between object operations. This is a local correctness harness, not evidence that Memory implements native CAS or that any cloud provider satisfies the assumed storage semantics. Equal payloads still receive different versions. There is no object deletion or version reset.
+
+`Node` stores an exclusive `high_key`, a `right_sibling`, and ordered entries or root children. Split creates a uniquely named right object with conditional creation, replaces the original leaf's truncated entries and sibling link in one version CAS, and updates the root with another CAS. If the original leaf changed after copying, its CAS fails and the right object remains unreachable. A lost response after linking simulates a crash before root repair. Point lookup and range traversal follow sibling links and repair root separators with CAS. A retry of a failed first stage needs a fresh right-object name; orphan collection is outside this experiment.
+
+Each entry keeps `committed: Option<Vec<u8>>` and `pending: Option<PendingIntent>`. The intent contains the transaction ID, epoch, and next value. `prepare` installs intents without changing committed values. `commit` verifies that every requested intent is installed, then conditionally creates the immutable `txns/{id}` terminal object. Reader abort, leader abort, and writer commit compete to create that same object. The first decision wins. A reader encountering an undecided intent attempts Abort, reads the winning decision, and uses CAS to fold either the previous committed value or the committed intent's next value. Commit retries reconcile the terminal object even after folding. A late physical intent associated with an Aborted transaction cannot publish its value.
+
+A scan collects leaf versions and values, then validates every visited leaf version. A concurrent prepare, split, or repair invalidates the collected image and causes a retry. The test pauses after the first leaf, commits a transaction across both leaves, and requires the complete new image. Separate point calls may observe different committed states when a commit occurs between them.
+
+Epoch 2 fences a **known** undecided epoch-1 transaction by first creating its Aborted terminal object. Epoch 1 cannot replace that object with Committed. Epoch-2 writes use a fresh transaction ID after recovering the old intents. The harness does not implement lease election, enumerate all old transactions, or reject a former leader that invents an unregistered fresh ID. Those require a durable registration and takeover protocol before a production backend can claim general fencing.
+
+The eight tests protect conditional-create and stale-version conflicts, ABA resistance, write failures before application and lost responses after application, split crash recovery for both point and range reads, stale split-copy rejection, concurrent reader abort of half-prepared writes, committed read-repair and commit retry, commit/abort competition, known-transaction fencing, and scan retry across a commit. Tests use barriers and task concurrency rather than timing sleeps. One test runs sixteen commit/abort competitions; this is bounded testing, not an exhaustive scheduler proof.
+
+The admitted scope is one active writer transaction, a root and leaf chain with byte-sized keys, unique transaction IDs, retained terminal objects, and shared simulated CAS state. The code has no production codec or compatibility promise. It omits general overlapping-writer serializability, arbitrary tree heights and root splits, lease clocks, garbage collection, watch/TTL, full `KvBackend`/`TxnService` responses, and real S3/MinIO validation. An applied node or repair write whose response is lost can return an error; callers retry reads and recovery against retained objects. Restart means constructing a fresh `Tree` over retained in-memory objects, not restarting an operating-system process.

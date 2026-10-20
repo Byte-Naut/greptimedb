@@ -1,0 +1,20 @@
+STARTED_AT 2026-10-20T22:43:35+08:00
+COMMAND cargo nextest run --locked --manifest-path src/common/meta/experiments/blink-tree-poc/Cargo.toml
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+────────────
+ Nextest run ID 6597731d-2f45-41a0-b2d1-8d9ec689735c with nextest profile: default
+    Starting 8 tests across 1 binary
+        PASS [   0.004s] (1/8) blink-tree-poc tests::cas_conflict_and_unknown_outcome
+        PASS [   0.004s] (2/8) blink-tree-poc tests::committed_reader_repairs
+        PASS [   0.004s] (3/8) blink-tree-poc tests::new_epoch_fences_old_leader
+        PASS [   0.004s] (4/8) blink-tree-poc tests::split_conflict_preserves_writes
+        PASS [   0.004s] (5/8) blink-tree-poc tests::partial_prepare_reader_aborts
+        PASS [   0.005s] (6/8) blink-tree-poc tests::split_crash_keeps_searchable
+        PASS [   0.005s] (7/8) blink-tree-poc tests::scan_retries_across_commit
+        PASS [   0.017s] (8/8) blink-tree-poc tests::abort_commit_race_has_one_winner
+────────────
+     Summary [   0.017s] 8 tests run: 8 passed, 0 skipped
+FINISHED_AT 2026-10-20T22:43:35+08:00
+EXIT_CODE 0

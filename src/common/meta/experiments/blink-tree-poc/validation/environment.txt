@@ -1,0 +1,23 @@
+RECORDED_AT 2026-10-20T22:43:18+08:00
+IMPLEMENTATION_COMMIT 45e53a82115c49d8c7fc800688c5f7a80ee9f232
+WORKING_DIRECTORY /home/a/.project-staging/greptimedb
+CARGO_TARGET_DIR /home/a/.cache/greptimedb-blink-review
+CARGO_BUILD_JOBS 2
+CARGO_INCREMENTAL 0
+Linux 6.18.33.2-microsoft-standard-WSL2 x86_64 GNU/Linux
+rustc 1.98.1 (48a229cea 2026-09-01)
+binary: rustc
+commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985
+commit-date: 2026-09-01
+host: x86_64-unknown-linux-gnu
+release: 1.98.1
+LLVM version: 22.1.8
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)
+release: 0.9.148
+commit-hash: cd1d6d5467322dbc0d39a80cb671d000ac302798
+commit-date: 2026-10-07
+host: x86_64-unknown-linux-gnu
+532dd6af42be10c25d858d156fb57a3cebae148674dc27c04580ffc485dfafec  src/common/meta/experiments/blink-tree-poc/Cargo.toml
+83d865a3628a83f3948859a08d23e146f8fdb20ec87251b316f1b35591473b2c  src/common/meta/experiments/blink-tree-poc/Cargo.lock
+c6d9a80159c52298e979b228271f3066d6528ea926ac983cb08aa3184f6bc789  src/common/meta/experiments/blink-tree-poc/src/lib.rs

@@ -1,0 +1,4 @@
+STARTED_AT 2026-10-20T22:43:43+08:00
+COMMAND cargo fmt --manifest-path src/common/meta/experiments/blink-tree-poc/Cargo.toml -- --check
+FINISHED_AT 2026-10-20T22:43:44+08:00
+EXIT_CODE 0

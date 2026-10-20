@@ -4060,6 +4060,107 @@ async fn test_exact_sequence_read_pk_format_compaction_multiple_inputs() {
     );
 }
 
+#[tokio::test]
+async fn test_per_series_range_cache_replays_without_sst() {
+    let mut env = TestEnv::with_prefix("test_per_series_range_cache_replays_without_sst").await;
+    let engine = env
+        .create_engine(MitoConfig {
+            default_flat_format: true,
+            experimental_series_scan_v2: false,
+            range_result_cache_size: ReadableSize::mb(8),
+            // Retain metadata needed to plan another scan, but no cached data pages.
+            vector_cache_size: ReadableSize(0),
+            parquet_page: crate::config::ParquetPageConfig {
+                content_cache_size: ReadableSize(0),
+                ..Default::default()
+            },
+            selector_result_cache_size: ReadableSize(0),
+            enable_write_cache: false,
+            ..Default::default()
+        })
+        .await;
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    let schema = test_util::rows_schema(&request);
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    // Overlapping SSTs also exercise merge and dedup before series distribution.
+    for (start, end) in [(0, 4), (3, 6)] {
+        test_util::put_rows(
+            &engine,
+            region_id,
+            Rows {
+                schema: schema.clone(),
+                rows: test_util::build_rows(start, end),
+            },
+        )
+        .await;
+        test_util::flush_region(&engine, region_id, None).await;
+    }
+
+    let scan = async || {
+        let scanner = engine
+            .scanner(
+                region_id,
+                ScanRequest {
+                    filters: vec![col("tag_0").gt_eq(lit("0"))],
+                    distribution: Some(TimeSeriesDistribution::PerSeries),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(&scanner, Scanner::Series(_)));
+        let batches = RecordBatches::try_collect(scanner.scan().await.unwrap())
+            .await
+            .unwrap();
+        let pretty = batches.pretty_print().unwrap();
+        let mut rows = pretty
+            .lines()
+            .filter(|line| line.starts_with("| ") && !line.starts_with("| tag_0 "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    let expected = vec![
+        "| 0     | 0.0     | 1970-01-01T00:00:00 |",
+        "| 1     | 1.0     | 1970-01-01T00:00:01 |",
+        "| 2     | 2.0     | 1970-01-01T00:00:02 |",
+        "| 3     | 3.0     | 1970-01-01T00:00:03 |",
+        "| 4     | 4.0     | 1970-01-01T00:00:04 |",
+        "| 5     | 5.0     | 1970-01-01T00:00:05 |",
+    ];
+    assert_eq!(expected, scan().await);
+
+    let region = engine.find_region(region_id).unwrap();
+    let version = region.version_control.current().version;
+    let files = version
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 2);
+    for file in files {
+        let path = file.file_path(region.table_dir(), region.path_type());
+        region
+            .access_layer
+            .object_store()
+            .delete(&path)
+            .await
+            .unwrap();
+    }
+
+    // Fresh scanners must replay the shared results; metadata alone cannot supply rows.
+    let (first, second) = tokio::join!(scan(), scan());
+    assert_eq!(expected, first);
+    assert_eq!(expected, second);
+}
+
 /// Exact sequence-range reads through the legacy `PerSeries` path: row-level
 /// filtering must hold across the flushed SST and the memtable.
 #[tokio::test]

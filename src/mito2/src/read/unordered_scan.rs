@@ -26,7 +26,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{
@@ -35,12 +35,14 @@ use store_api::region_engine::{
 
 use crate::error::{PartitionOutOfRangeSnafu, Result};
 use crate::read::pruner::{PartitionPruner, Pruner};
+use crate::read::range_cache::{build_source_range_cache_key, get_or_load_range_sources};
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     PartitionMetrics, PartitionMetricsList, scan_flat_file_ranges, scan_flat_mem_ranges,
 };
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
-use crate::read::{ScannerMetrics, scan_util};
+use crate::read::{BoxedRecordBatchStream, ScannerMetrics, scan_util};
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
 /// Scans a region without providing any output ordering guarantee.
 ///
@@ -122,51 +124,73 @@ impl UnorderedScan {
         partition_pruner: Arc<PartitionPruner>,
     ) -> impl Stream<Item = Result<RecordBatch>> {
         try_stream! {
-            // Gets range meta.
-            let range_meta = &stream_ctx.ranges[part_range_id];
-            let part_range = range_meta.new_partition_range(part_range_id);
-            let pre_filter_mode = stream_ctx.range_pre_filter_mode(&part_range);
-            for index in &range_meta.row_group_indices {
-                if stream_ctx.is_mem_range_index(*index) {
-                    let stream = scan_flat_mem_ranges(
-                        stream_ctx.clone(),
-                        part_metrics.clone(),
-                        *index,
-                        range_meta.time_range,
-                    );
-                    for await record_batch in stream {
-                        yield record_batch?;
-                    }
-                } else if stream_ctx.is_file_range_index(*index) {
-                    // Common manifest-level fast-skip shared by UnorderedScan and SeqScan.
-                    if partition_pruner
-                        .try_skip_manifest_pruned_file_range(*index, &part_metrics)
-                    {
-                        continue;
-                    }
-                    let stream = scan_flat_file_ranges(
+            let range = stream_ctx.ranges[part_range_id].new_partition_range(part_range_id);
+            let key = build_source_range_cache_key(&stream_ctx, &range, &partition_pruner);
+            let build = || async {
+                let sources = Self::build_flat_partition_range_sources(
+                    &stream_ctx, part_range_id, &part_metrics, partition_pruner,
+                ).await?;
+                Ok((sources, DEFAULT_READ_BATCH_SIZE))
+            };
+            let (sources, _) = if let Some(key) = key {
+                get_or_load_range_sources(&stream_ctx.input.cache_strategy, key, &part_metrics, build).await?
+            } else {
+                build().await?
+            };
+            for mut source in sources {
+                while let Some(batch) = source.try_next().await? {
+                    yield batch;
+                }
+            }
+        }
+    }
+
+    /// Preserves the original task's source boundaries for cache replay.
+    async fn build_flat_partition_range_sources(
+        stream_ctx: &Arc<StreamContext>,
+        part_range_id: usize,
+        part_metrics: &PartitionMetrics,
+        partition_pruner: Arc<PartitionPruner>,
+    ) -> Result<Vec<BoxedRecordBatchStream>> {
+        let range_meta = &stream_ctx.ranges[part_range_id];
+        let part_range = range_meta.new_partition_range(part_range_id);
+        let pre_filter_mode = stream_ctx.range_pre_filter_mode(&part_range);
+        let mut sources: Vec<BoxedRecordBatchStream> = Vec::new();
+        for index in &range_meta.row_group_indices {
+            if stream_ctx.is_mem_range_index(*index) {
+                sources.push(Box::pin(scan_flat_mem_ranges(
+                    stream_ctx.clone(),
+                    part_metrics.clone(),
+                    *index,
+                    range_meta.time_range,
+                )));
+            } else if stream_ctx.is_file_range_index(*index) {
+                if partition_pruner.try_skip_manifest_pruned_file_range(*index, part_metrics) {
+                    continue;
+                }
+                sources.push(Box::pin(
+                    scan_flat_file_ranges(
                         stream_ctx.clone(),
                         part_metrics.clone(),
                         *index,
                         "unordered_scan_files",
                         partition_pruner.clone(),
-                    ).await?;
-                    for await record_batch in stream {
-                        yield record_batch?;
-                    }
-                } else {
-                    let stream = scan_util::maybe_scan_flat_other_ranges(
-                        &stream_ctx,
+                    )
+                    .await?,
+                ));
+            } else {
+                sources.push(
+                    scan_util::maybe_scan_flat_other_ranges(
+                        stream_ctx,
                         *index,
-                        &part_metrics,
+                        part_metrics,
                         pre_filter_mode,
-                    ).await?;
-                    for await record_batch in stream {
-                        yield record_batch?;
-                    }
-                }
+                    )
+                    .await?,
+                );
             }
         }
+        Ok(sources)
     }
 
     /// Scan [`Batch`] in all partitions one by one.

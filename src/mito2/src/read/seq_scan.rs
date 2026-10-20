@@ -26,13 +26,14 @@ use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::schema::SchemaRef;
+use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
 use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{
     PartitionRange, PrepareRequest, QueryScanContext, RegionScanner, ScannerProperties,
 };
-use store_api::storage::TimeSeriesRowSelector;
+use store_api::storage::{TimeSeriesDistribution, TimeSeriesRowSelector};
 use tokio::sync::Semaphore;
 
 use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu};
@@ -41,9 +42,7 @@ use crate::read::flat_merge::FlatMergeReader;
 use crate::read::last_row::FlatLastRowReader;
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
-use crate::read::range_cache::{
-    build_range_cache_key, cache_flat_range_stream, cached_flat_range_stream,
-};
+use crate::read::range_cache;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     MIN_COMPACTION_SPLIT_ROWS, PartitionMetrics, PartitionMetricsList, SplitRecordBatchStream,
@@ -283,16 +282,43 @@ impl SeqScan {
         file_scan_semaphore: Option<Arc<Semaphore>>,
         merge_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<(BoxedRecordBatchStream, usize)> {
-        let cache_key = build_range_cache_key(stream_ctx, part_range);
-
-        if let Some(key) = cache_key.as_ref() {
-            if let Some(value) = stream_ctx.input.cache_strategy.get_range_result(key) {
-                part_metrics.inc_range_cache_hit();
-                return Ok((cached_flat_range_stream(value), DEFAULT_READ_BATCH_SIZE));
-            }
-            part_metrics.inc_range_cache_miss();
+        let build = || {
+            Self::build_flat_partition_range_read_inner(
+                stream_ctx,
+                part_range,
+                compaction,
+                part_metrics,
+                partition_pruner,
+                file_scan_semaphore,
+                merge_semaphore,
+            )
+        };
+        // The series distributor consumes complete, deduplicated ranges. Its
+        // PerSeries input bypasses source caching, so cache the merged result here.
+        if !compaction
+            && stream_ctx.input.distribution == Some(TimeSeriesDistribution::PerSeries)
+            && let Some(key) = range_cache::build_range_cache_key(stream_ctx, part_range)
+        {
+            return range_cache::get_or_load_range_result(
+                &stream_ctx.input.cache_strategy,
+                key,
+                part_metrics,
+                build,
+            )
+            .await;
         }
+        build().await
+    }
 
+    async fn build_flat_partition_range_read_inner(
+        stream_ctx: &Arc<StreamContext>,
+        part_range: &PartitionRange,
+        compaction: bool,
+        part_metrics: &PartitionMetrics,
+        partition_pruner: Arc<PartitionPruner>,
+        file_scan_semaphore: Option<Arc<Semaphore>>,
+        merge_semaphore: Option<Arc<Semaphore>>,
+    ) -> Result<(BoxedRecordBatchStream, usize)> {
         let mut sources = Vec::new();
         let split_batch_size = build_flat_sources(
             stream_ctx,
@@ -315,16 +341,6 @@ impl SeqScan {
             channel_size,
         )
         .await?;
-
-        let stream = match cache_key {
-            Some(key) => cache_flat_range_stream(
-                stream,
-                stream_ctx.input.cache_strategy.clone(),
-                key,
-                part_metrics.clone(),
-            ),
-            None => stream,
-        };
 
         Ok((stream, estimated_rows_per_batch))
     }
@@ -630,7 +646,69 @@ impl fmt::Debug for SeqScan {
 
 /// Builds flat sources for the partition range and push them to the `sources` vector.
 /// Returns the estimated rows per batch after splitting if splitting is applied, or `None`.
-pub(crate) async fn build_flat_sources(
+pub(crate) fn build_flat_sources<'a>(
+    stream_ctx: &'a Arc<StreamContext>,
+    part_range: &'a PartitionRange,
+    compaction: bool,
+    part_metrics: &'a PartitionMetrics,
+    partition_pruner: Arc<PartitionPruner>,
+    sources: &'a mut Vec<BoxedRecordBatchStream>,
+    semaphore: Option<Arc<Semaphore>>,
+) -> BoxFuture<'a, Result<Option<usize>>> {
+    // Erase the native cache loader future at the shared query/compaction boundary.
+    // Otherwise compaction's outer state machine embeds the nested reader/cache layouts.
+    Box::pin(async move {
+        let key = if compaction {
+            None
+        } else {
+            range_cache::build_source_range_cache_key(stream_ctx, part_range, &partition_pruner)
+        };
+        let build = || async {
+            let mut sources = Vec::new();
+            let split = build_uncached_flat_sources(
+                stream_ctx,
+                part_range,
+                compaction,
+                part_metrics,
+                partition_pruner,
+                &mut sources,
+                semaphore,
+            )
+            .await?;
+            Ok((sources, split.unwrap_or(0)))
+        };
+        let (loaded, split) = if let Some(key) = key {
+            range_cache::get_or_load_range_sources(
+                &stream_ctx.input.cache_strategy,
+                key,
+                part_metrics,
+                build,
+            )
+            .await?
+        } else {
+            build().await?
+        };
+        // Splitting and the original merge/dedup remain above cached source replay.
+        for stream in loaded {
+            if split > 0 {
+                sources.push(Box::pin(SplitRecordBatchStream::new(stream)));
+            } else {
+                sources.push(stream);
+            }
+        }
+        if split > 0 {
+            common_telemetry::debug!(
+                "Splitting record batches, region: {}, sources: {}, part_range: {:?}",
+                stream_ctx.input.region_metadata().region_id,
+                sources.len(),
+                part_range,
+            );
+        }
+        Ok((split > 0).then_some(split))
+    })
+}
+
+async fn build_uncached_flat_sources(
     stream_ctx: &Arc<StreamContext>,
     part_range: &PartitionRange,
     compaction: bool,
@@ -750,24 +828,7 @@ pub(crate) async fn build_flat_sources(
     } else {
         None
     };
-    let should_split = split_batch_size.is_some();
-
-    for stream in ordered_sources.into_iter().flatten() {
-        if should_split {
-            sources.push(Box::pin(SplitRecordBatchStream::new(stream)));
-        } else {
-            sources.push(stream);
-        }
-    }
-
-    if should_split {
-        common_telemetry::debug!(
-            "Splitting record batches, region: {}, sources: {}, part_range: {:?}",
-            stream_ctx.input.region_metadata().region_id,
-            sources.len(),
-            part_range,
-        );
-    }
+    sources.extend(ordered_sources.into_iter().flatten());
 
     Ok(split_batch_size)
 }

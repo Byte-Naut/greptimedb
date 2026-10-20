@@ -198,6 +198,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to load range result"))]
+    LoadRangeResult {
+        source: Arc<Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to load SST metadata"))]
     LoadSstMeta {
         source: Arc<Error>,
@@ -1433,7 +1440,9 @@ impl Error {
         match self {
             Error::OpenDal { error, .. } => error.kind() == ErrorKind::NotFound,
             Error::ManifestDeltaNotFound { .. } => true,
-            Error::LoadSstMeta { source, .. } => source.is_object_not_found(),
+            Error::LoadSstMeta { source, .. } | Error::LoadRangeResult { source, .. } => {
+                source.is_object_not_found()
+            }
             _ => false,
         }
     }
@@ -1556,7 +1565,9 @@ impl ErrorExt for Error {
             OpenRegion { source, .. } => source.status_code(),
 
             WriteParquet { .. } => StatusCode::StorageUnavailable,
-            WriteGroup { source, .. } | LoadSstMeta { source, .. } => source.status_code(),
+            WriteGroup { source, .. }
+            | LoadSstMeta { source, .. }
+            | LoadRangeResult { source, .. } => source.status_code(),
             InvalidBatch { .. } => StatusCode::InvalidArguments,
             InvalidRecordBatch { .. } => StatusCode::InvalidArguments,
             ConvertVector { source, .. } => source.status_code(),
@@ -1707,6 +1718,7 @@ impl ErrorExt for Error {
 
             OpenRegion { source, .. }
             | LoadSstMeta { source, .. }
+            | LoadRangeResult { source, .. }
             | WriteGroup { source, .. }
             | FlushRegion { source, .. }
             | BuildIndexAsync { source, .. }
@@ -1839,10 +1851,14 @@ mod tests {
             let expected_status = source.status_code();
             let expected_retry = source.retry_hint();
             let source = Arc::new(source);
-            let wrapped = LoadSstMetaSnafu.into_error(source);
-            assert_eq!(expected_not_found, wrapped.is_object_not_found());
-            assert_eq!(expected_status, wrapped.status_code());
-            assert_eq!(expected_retry, wrapped.retry_hint());
+            for wrapped in [
+                LoadSstMetaSnafu.into_error(source.clone()),
+                LoadRangeResultSnafu.into_error(source),
+            ] {
+                assert_eq!(expected_not_found, wrapped.is_object_not_found());
+                assert_eq!(expected_status, wrapped.status_code());
+                assert_eq!(expected_retry, wrapped.retry_hint());
+            }
         }
     }
 

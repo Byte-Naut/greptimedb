@@ -47,9 +47,7 @@ use crate::error::{
 use crate::read::BoxedRecordBatchStream;
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RowGroupIndex;
-use crate::read::range_cache::{
-    build_candidate_range_cache_key, cache_flat_range_stream, cached_flat_range_stream,
-};
+use crate::read::range_cache::{build_candidate_range_cache_key, get_or_load_range_result};
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::{PartitionMetrics, new_filter_metrics, scan_flat_mem_ranges};
 use crate::series_index::{
@@ -158,17 +156,6 @@ impl SeriesCandidateScanner {
         for (range_idx, part_range) in all_ranges.into_iter().enumerate() {
             let range_builder = range_builder.clone();
             tasks.push(common_runtime::spawn_query(async move {
-                let _permit = range_builder
-                    .range_semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|error| {
-                        UnexpectedSnafu {
-                            reason: format!("failed to acquire candidate range permit: {error}"),
-                        }
-                        .build()
-                    })?;
                 range_builder
                     .build_range_stream(part_range, range_idx)
                     .await
@@ -371,14 +358,39 @@ impl SeriesCandidateRangeBuilder {
         } else {
             build_candidate_range_cache_key(&self.stream_ctx, &part_range)
         };
-        if let Some(key) = cache_key.as_ref() {
-            if let Some(value) = self.stream_ctx.input.cache_strategy.get_range_result(key) {
-                self.part_metrics.inc_range_cache_hit();
-                return Ok(cached_flat_range_stream(value));
-            }
-            self.part_metrics.inc_range_cache_miss();
+        let build = || async {
+            self.build_uncached_range_stream(part_range, merge_partition)
+                .await
+                .map(|stream| (stream, crate::sst::parquet::DEFAULT_READ_BATCH_SIZE))
+        };
+        if let Some(key) = cache_key {
+            get_or_load_range_result(
+                &self.stream_ctx.input.cache_strategy,
+                key,
+                &self.part_metrics,
+                build,
+            )
+            .await
+            .map(|(stream, _)| stream)
+        } else {
+            build().await.map(|(stream, _)| stream)
         }
+    }
 
+    async fn build_uncached_range_stream(
+        &self,
+        part_range: PartitionRange,
+        merge_partition: usize,
+    ) -> Result<BoxedRecordBatchStream> {
+        // Release the build permit before the cache loader drives parallel sources,
+        // which acquire permits from this same semaphore.
+        let _permit = self.range_semaphore.acquire().await.map_err(|error| {
+            UnexpectedSnafu {
+                reason: format!("failed to acquire candidate range permit: {error}"),
+            }
+            .build()
+        })?;
+        let range_meta = &self.stream_ctx.ranges[part_range.identifier];
         let mut sources = Vec::with_capacity(range_meta.row_group_indices.len());
         for index in &range_meta.row_group_indices {
             let source = self.build_source(*index, range_meta.time_range).await?;
@@ -400,15 +412,7 @@ impl SeriesCandidateRangeBuilder {
             "SeriesCandidateScanner::range_merge",
         )?;
 
-        Ok(match cache_key {
-            Some(key) => cache_flat_range_stream(
-                stream,
-                self.stream_ctx.input.cache_strategy.clone(),
-                key,
-                self.part_metrics.clone(),
-            ),
-            None => stream,
-        })
+        Ok(stream)
     }
 
     async fn build_source(
@@ -959,6 +963,7 @@ mod tests {
                     .input
                     .cache_strategy
                     .get_range_result(&key)
+                    .await
                     .is_none()
             );
         }

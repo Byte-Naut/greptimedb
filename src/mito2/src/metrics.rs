@@ -699,3 +699,296 @@ impl StagerNotifier for StagerMetrics {
         self.recycle_cache_bytes.sub(size as i64);
     }
 }
+
+pub(crate) fn cache_batch_observer(
+    cache_type: &'static str,
+) -> impl Fn(common_base::range_read::BatchEvent) + Send + Sync + 'static {
+    use common_base::range_read::BatchEvent;
+
+    let requests_active = CACHE_BATCH_REQUESTS_ACTIVE.with_label_values(&[cache_type]);
+    let bytes_active = CACHE_BATCH_REQUESTED_BYTES_ACTIVE.with_label_values(&[cache_type]);
+    let active = CACHE_BATCH_ACTIVE.with_label_values(&[cache_type]);
+    let started = CACHE_BATCH_STARTED.with_label_values(&[cache_type]);
+    let requests = CACHE_BATCH_REQUESTS.with_label_values(&[cache_type]);
+    let reads = CACHE_BATCH_READS.with_label_values(&[cache_type]);
+    let requested_bytes = CACHE_BATCH_REQUESTED_BYTES.with_label_values(&[cache_type]);
+    let planned_bytes = CACHE_BATCH_PLANNED_BYTES.with_label_values(&[cache_type]);
+    let queue_wait = CACHE_BATCH_QUEUE_WAIT.with_label_values(&[cache_type]);
+    let outcomes = ["success", "failure", "cancelled"].map(|outcome| {
+        (
+            CACHE_BATCH_FINISHED.with_label_values(&[cache_type, outcome]),
+            CACHE_BATCH_ELAPSED.with_label_values(&[cache_type, outcome]),
+        )
+    });
+
+    move |event| match event {
+        BatchEvent::Admitted { bytes } => {
+            requests_active.inc();
+            // BatchReader admits at most a u32-sized request.
+            bytes_active.add(bytes as i64);
+        }
+        BatchEvent::Released { bytes } => {
+            requests_active.dec();
+            bytes_active.sub(bytes as i64);
+        }
+        BatchEvent::Started {
+            requests: batch_requests,
+            reads: batch_reads,
+            requested_bytes: batch_requested_bytes,
+            planned_bytes: batch_planned_bytes,
+            queue_wait: batch_queue_wait,
+        } => {
+            active.inc();
+            started.inc();
+            requests.inc_by(batch_requests as u64);
+            reads.inc_by(batch_reads as u64);
+            requested_bytes.inc_by(batch_requested_bytes);
+            planned_bytes.inc_by(batch_planned_bytes);
+            queue_wait.inc_by(batch_queue_wait.as_secs_f64());
+        }
+        BatchEvent::Finished {
+            elapsed,
+            failed,
+            cancelled,
+        } => {
+            active.dec();
+            let index = if cancelled { 2 } else { usize::from(failed) };
+            outcomes[index].0.inc();
+            outcomes[index].1.observe(elapsed.as_secs_f64());
+        }
+    }
+}
+
+lazy_static! {
+    /// Admitted requests include send waiters, queued requests and active reads.
+    pub static ref CACHE_BATCH_REQUESTS_ACTIVE: IntGaugeVec = register_int_gauge_vec!(
+        "greptime_mito_cache_batch_requests_active",
+        "Admitted cache byte requests, including channel send waiters, queued requests and active reads",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_REQUESTED_BYTES_ACTIVE: IntGaugeVec = register_int_gauge_vec!(
+        "greptime_mito_cache_batch_requested_bytes_active",
+        "Requested bytes held by admitted requests, not merged read buffers or process memory",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_ACTIVE: IntGaugeVec = register_int_gauge_vec!(
+        "greptime_mito_cache_batch_active",
+        "Cache I/O batches currently executing",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_STARTED: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_batch_started_total", "Cache I/O batches started",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_REQUESTS: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_batch_requests_total", "Requests submitted to started cache I/O batches",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_READS: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_batch_read_ranges_total",
+        "Planned read ranges after merging, not physical backend GET operations",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_REQUESTED_BYTES: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_batch_requested_bytes_total",
+        "Requested bytes in started batches, including overlapping requests",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_PLANNED_BYTES: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_batch_planned_bytes_total",
+        "Planned read bytes including merged gaps, not successful physical I/O bytes",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_QUEUE_WAIT: CounterVec = register_counter_vec!(
+        "greptime_mito_cache_batch_queue_wait_seconds_total",
+        "Sum of per-request time from admission to batch start; excludes byte-permit wait and requests cancelled before batching",
+        &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_BATCH_FINISHED: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_batch_finished_total", "Cache I/O batches finished by outcome",
+        &[TYPE_LABEL, "outcome"]
+    ).unwrap();
+    pub static ref CACHE_BATCH_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_mito_cache_batch_seconds",
+        "Cache batch reader wall time by outcome, excluding queue wait and response copies",
+        &[TYPE_LABEL, "outcome"], exponential_buckets(0.0001, 10.0, 6).unwrap()
+    ).unwrap();
+    pub static ref CACHE_PAGE_EVENTS: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_page_events_total", "Logical page cache events", &[TYPE_LABEL, "event"]
+    ).unwrap();
+    pub static ref CACHE_PAGE_LOADED_BYTES: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_page_loaded_bytes_total", "Bytes produced by successful page loaders, excluding waiters", &[TYPE_LABEL]
+    ).unwrap();
+    pub static ref CACHE_PAGE_WEIGHT: IntGaugeVec = register_int_gauge_vec!(
+        "greptime_mito_cache_page_weight", "Backend page cache weight, not process RSS", &[TYPE_LABEL, "kind"]
+    ).unwrap();
+}
+
+/// Binds shared page/cache I/O metrics while retaining the business hit/miss labels.
+pub(crate) fn cache_page_observer(
+    cache_type: &'static str,
+    legacy_type: &'static str,
+    lookup_counts: fn(usize, usize) -> (usize, usize),
+) -> common_cache::paged::PageCacheObserver {
+    use common_cache::paged::PageEvent;
+    let hits = CACHE_HIT.with_label_values(&[legacy_type]);
+    let misses = CACHE_MISS.with_label_values(&[legacy_type]);
+    let loaded = CACHE_PAGE_LOADED_BYTES.with_label_values(&[cache_type]);
+    let unbatched = CACHE_PAGE_EVENTS.with_label_values(&[cache_type, "unbatched_read"]);
+    let retry = CACHE_PAGE_EVENTS.with_label_values(&[cache_type, "closed_retry"]);
+    let usage = CACHE_PAGE_WEIGHT.with_label_values(&[cache_type, "usage"]);
+    let capacity = CACHE_PAGE_WEIGHT.with_label_values(&[cache_type, "capacity"]);
+    common_cache::paged::PageCacheObserver {
+        bytes: CACHE_BYTES.with_label_values(&[legacy_type]),
+        loads: Some(cache_loading_metrics(cache_type)),
+        events: std::sync::Arc::new(move |event| match event {
+            PageEvent::Lookup {
+                hits: count,
+                misses: missing,
+            } => {
+                let (count, missing) = lookup_counts(count, missing);
+                hits.inc_by(count as u64);
+                misses.inc_by(missing as u64);
+            }
+            PageEvent::Loaded { bytes } => loaded.inc_by(bytes),
+            PageEvent::UnbatchedRead => unbatched.inc(),
+            PageEvent::ClosedRetry => retry.inc(),
+            PageEvent::Residency {
+                usage: used,
+                capacity: limit,
+            } => {
+                usage.set(i64::try_from(used).unwrap_or(i64::MAX));
+                capacity.set(i64::try_from(limit).unwrap_or(i64::MAX));
+            }
+            PageEvent::Evicted { cause } => CACHE_EVICTION
+                .with_label_values(&[legacy_type, cause.as_str()])
+                .inc(),
+        }),
+        batches: std::sync::Arc::new(cache_batch_observer(cache_type)),
+    }
+}
+
+lazy_static! {
+    pub static ref CACHE_PAGE_BYTES: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_page_bytes_total",
+        "Logical page fetch bytes by kind; not physical backend bytes",
+        &[TYPE_LABEL, "kind"]
+    )
+    .unwrap();
+}
+
+/// Records logical byte amplification independently of physical batch reads.
+pub(crate) fn cache_page_fetch_metrics(
+    cache_type: &'static str,
+    stats: &common_cache::paged::PageFetchStats,
+) {
+    for (kind, value) in [
+        ("requested", stats.requested_bytes),
+        ("aligned", stats.aligned_bytes),
+        ("unique_requested", stats.unique_requested_bytes),
+        ("cached", stats.cached_bytes),
+    ] {
+        CACHE_PAGE_BYTES
+            .with_label_values(&[cache_type, kind])
+            .inc_by(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common_base::range_read::BatchEvent;
+    use common_cache::paged::{PageEvent, PageFetchStats};
+
+    #[test]
+    fn test_page_observer_retains_business_lookup_units() {
+        let page = cache_page_observer("test_page_unit", "test_page_unit", |hits, misses| {
+            (hits, misses)
+        });
+        let request =
+            cache_page_observer("test_request_unit", "test_request_unit", |hits, misses| {
+                (usize::from(hits > 0), usize::from(misses > 0))
+            });
+        for observer in [&page, &request] {
+            (observer.events)(PageEvent::Lookup { hits: 3, misses: 2 });
+            (observer.events)(PageEvent::Loaded { bytes: 4096 });
+        }
+        assert_eq!(CACHE_HIT.with_label_values(&["test_page_unit"]).get(), 3);
+        assert_eq!(CACHE_MISS.with_label_values(&["test_page_unit"]).get(), 2);
+        assert_eq!(CACHE_HIT.with_label_values(&["test_request_unit"]).get(), 1);
+        assert_eq!(
+            CACHE_MISS.with_label_values(&["test_request_unit"]).get(),
+            1
+        );
+        cache_page_fetch_metrics(
+            "test_page_unit",
+            &PageFetchStats {
+                requested_bytes: 7,
+                aligned_bytes: 12,
+                unique_requested_bytes: 6,
+                cached_bytes: 3,
+                ..Default::default()
+            },
+        );
+        for (kind, expected) in [
+            ("requested", 7),
+            ("aligned", 12),
+            ("unique_requested", 6),
+            ("cached", 3),
+        ] {
+            assert_eq!(
+                CACHE_PAGE_BYTES
+                    .with_label_values(&["test_page_unit", kind])
+                    .get(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_observer_separates_planned_reads_from_requests() {
+        let kind = "test_batch_binding";
+        let observer = cache_batch_observer(kind);
+        observer(BatchEvent::Admitted { bytes: 8 });
+        observer(BatchEvent::Started {
+            requests: 2,
+            reads: 1,
+            requested_bytes: 8,
+            planned_bytes: 12,
+            queue_wait: Duration::from_millis(2),
+        });
+        assert_eq!(CACHE_BATCH_REQUESTS.with_label_values(&[kind]).get(), 2);
+        assert_eq!(CACHE_BATCH_READS.with_label_values(&[kind]).get(), 1);
+        assert_eq!(
+            CACHE_BATCH_REQUESTED_BYTES.with_label_values(&[kind]).get(),
+            8
+        );
+        assert_eq!(
+            CACHE_BATCH_PLANNED_BYTES.with_label_values(&[kind]).get(),
+            12
+        );
+        observer(BatchEvent::Finished {
+            elapsed: Duration::from_millis(1),
+            failed: false,
+            cancelled: true,
+        });
+        observer(BatchEvent::Released { bytes: 8 });
+        assert_eq!(CACHE_BATCH_ACTIVE.with_label_values(&[kind]).get(), 0);
+        assert_eq!(
+            CACHE_BATCH_REQUESTS_ACTIVE.with_label_values(&[kind]).get(),
+            0
+        );
+        assert_eq!(
+            CACHE_BATCH_REQUESTED_BYTES_ACTIVE
+                .with_label_values(&[kind])
+                .get(),
+            0
+        );
+        assert_eq!(
+            CACHE_BATCH_FINISHED
+                .with_label_values(&[kind, "cancelled"])
+                .get(),
+            1
+        );
+    }
+}

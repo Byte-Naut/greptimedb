@@ -137,6 +137,7 @@ mod test {
         async fn handle_request(
             &self,
             request: Arc<RegionRequest>,
+            accept_partial_result: bool,
         ) -> common_meta::error::Result<RegionResponse> {
             let gate = {
                 let mut gate = self.gate.lock().unwrap();
@@ -158,7 +159,9 @@ mod test {
                     .fail();
                 }
             }
-            self.inner.handle(request).await
+            self.inner
+                .handle_request(request, accept_partial_result)
+                .await
         }
 
         async fn handle_query(

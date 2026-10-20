@@ -15,18 +15,24 @@
 use std::borrow::Borrow;
 use std::marker::PhantomData;
 
-use api::v1::region::{RegionRequest, RegionResponse, region_request};
+use api::v1::region::{RegionRequest, RegionRequestHeader, RegionResponse};
 use prost::Message;
 use tonic::Status;
 use tonic::codec::{Codec, EncodeBuf, Encoder};
 use tonic_prost::ProstDecoder;
 
-/// Encodes owned or shared region requests using the existing protobuf wire format.
-pub(crate) struct RegionCodec<R>(PhantomData<R>);
+/// Encodes one owned or shared region request, optionally replacing its header.
+pub(crate) struct RegionCodec<R> {
+    header: Option<RegionRequestHeader>,
+    marker: PhantomData<R>,
+}
 
-impl<R> Default for RegionCodec<R> {
-    fn default() -> Self {
-        Self(PhantomData)
+impl<R> RegionCodec<R> {
+    pub(crate) fn new(header: Option<RegionRequestHeader>) -> Self {
+        Self {
+            header,
+            marker: PhantomData,
+        }
     }
 }
 
@@ -40,7 +46,10 @@ where
     type Decoder = ProstDecoder<RegionResponse>;
 
     fn encoder(&mut self) -> Self::Encoder {
-        RegionEncoder(PhantomData)
+        RegionEncoder {
+            header: self.header.take(),
+            marker: PhantomData,
+        }
     }
 
     fn decoder(&mut self) -> Self::Decoder {
@@ -49,7 +58,10 @@ where
 }
 
 /// Borrows the protobuf payload while consuming its owned or shared container.
-pub(crate) struct RegionEncoder<R>(PhantomData<R>);
+pub(crate) struct RegionEncoder<R> {
+    header: Option<RegionRequestHeader>,
+    marker: PhantomData<R>,
+}
 
 impl<R: Borrow<RegionRequest>> Encoder for RegionEncoder<R> {
     type Item = R;
@@ -57,13 +69,7 @@ impl<R: Borrow<RegionRequest>> Encoder for RegionEncoder<R> {
 
     fn encode(&mut self, item: R, buf: &mut EncodeBuf<'_>) -> Result<(), Status> {
         let request = item.borrow();
-        if matches!(
-            request.body,
-            Some(region_request::Body::Inserts(_) | region_request::Body::Deletes(_))
-        ) {
-            // Only the header is copied; retries keep borrowing the shared rows.
-            let mut header = request.header.clone().unwrap_or_default();
-            api::region::set_accept_partial_result(&mut header);
+        if let Some(header) = self.header.take() {
             RegionRequest {
                 header: Some(header),
                 body: None,

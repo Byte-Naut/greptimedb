@@ -68,8 +68,14 @@ pub struct RegionRequester {
 
 #[async_trait]
 impl Datanode for RegionRequester {
-    async fn handle_request(&self, request: Arc<RegionRequest>) -> MetaResult<RegionResponse> {
-        self.handle_inner(request).await.map_err(Into::into)
+    async fn handle_request(
+        &self,
+        request: Arc<RegionRequest>,
+        accept_partial_result: bool,
+    ) -> MetaResult<RegionResponse> {
+        self.handle_inner(request, accept_partial_result)
+            .await
+            .map_err(Into::into)
     }
 
     async fn handle_query(&self, request: QueryRequest) -> MetaResult<SendableRecordBatchStream> {
@@ -142,12 +148,13 @@ impl RegionRequester {
     ///
     /// Accepts both [`RegionRequest`] and [`Arc<RegionRequest>`]. Callers can retain a
     /// shared request for another attempt; this method does not retry or determine
-    /// whether replaying the request is safe.
-    pub async fn handle<R>(&self, request: R) -> Result<RegionResponse>
+    /// whether replaying the request is safe. When `accept_partial_result` is true,
+    /// callers must inspect failed entries before retrying.
+    pub async fn handle<R>(&self, request: R, accept_partial_result: bool) -> Result<RegionResponse>
     where
         R: Borrow<RegionRequest> + Send + Sync + 'static,
     {
-        self.handle_inner(request).await
+        self.handle_inner(request, accept_partial_result).await
     }
 
     /// Sends a remote dynamic filter update to the region service.
@@ -156,8 +163,11 @@ impl RegionRequester {
         query_id: impl Into<String>,
         update: RemoteDynFilterUpdate,
     ) -> Result<RegionResponse> {
-        self.handle_inner(build_remote_dyn_filter_update_request(query_id, update))
-            .await
+        self.handle_inner(
+            build_remote_dyn_filter_update_request(query_id, update),
+            false,
+        )
+        .await
     }
 
     /// Unregisters a remote dynamic filter in the region service.
@@ -166,13 +176,18 @@ impl RegionRequester {
         query_id: impl Into<String>,
         unregister: RemoteDynFilterUnregister,
     ) -> Result<RegionResponse> {
-        self.handle_inner(build_remote_dyn_filter_unregister_request(
-            query_id, unregister,
-        ))
+        self.handle_inner(
+            build_remote_dyn_filter_unregister_request(query_id, unregister),
+            false,
+        )
         .await
     }
 
-    async fn handle_inner<R>(&self, request: R) -> Result<RegionResponse>
+    async fn handle_inner<R>(
+        &self,
+        request: R,
+        accept_partial_result: bool,
+    ) -> Result<RegionResponse>
     where
         R: Borrow<RegionRequest> + Send + Sync + 'static,
     {
@@ -205,6 +220,20 @@ impl RegionRequester {
             }
         }
 
+        // Prepare only the header; shared retries keep borrowing the original rows.
+        let header = if request_count.is_some() {
+            let mut header = request.borrow().header.clone().unwrap_or_default();
+            if accept_partial_result {
+                api::region::set_accept_partial_result(&mut header);
+            } else if let Some(context) = &mut header.query_context {
+                context
+                    .extensions
+                    .remove(api::region::ACCEPT_PARTIAL_RESULT);
+            }
+            Some(header)
+        } else {
+            None
+        };
         let response = async {
             client
                 .ready()
@@ -221,7 +250,7 @@ impl RegionRequester {
                     tonic::codegen::http::uri::PathAndQuery::from_static(
                         "/greptime.v1.region.Region/Handle",
                     ),
-                    RegionCodec::default(),
+                    RegionCodec::new(header),
                 )
                 .await
         }
@@ -230,8 +259,8 @@ impl RegionRequester {
         .into_inner();
 
         match request_count {
-            Some(count) => decode_write_response(response, count),
-            None => decode_region_response(response),
+            Some(count) if accept_partial_result => decode_write_response(response, count),
+            _ => decode_region_response(response),
         }
     }
 }
@@ -422,10 +451,7 @@ pub fn decode_region_response(response: PbRegionResponse) -> Result<RegionRespon
 
 /// Decodes an inserts/deletes response, validating failures against the original entry count.
 /// A failed single-entry request returns its underlying error.
-pub fn decode_write_response(
-    response: PbRegionResponse,
-    entry_count: usize,
-) -> Result<RegionResponse> {
+fn decode_write_response(response: PbRegionResponse, entry_count: usize) -> Result<RegionResponse> {
     if response.failures.is_empty() {
         if response
             .header
@@ -706,7 +732,7 @@ mod tests {
             );
             assert_eq!(
                 requester
-                    .handle(build_insert_request())
+                    .handle(build_insert_request(), true)
                     .await
                     .unwrap()
                     .affected_rows,
@@ -714,7 +740,7 @@ mod tests {
             );
             assert_eq!(
                 requester
-                    .handle(Arc::clone(&shared))
+                    .handle(Arc::clone(&shared), true)
                     .await
                     .unwrap()
                     .affected_rows,
@@ -743,6 +769,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_partial_result_requires_explicit_acceptance() {
+        let server = RegionTestServer::start().await;
+        let requester = server.create_requester(ChannelConfig::default(), false, false);
+        let shared = Arc::new(with_partial_result(build_insert_request()));
+        for accept_partial_result in [false, true, false] {
+            requester
+                .handle(Arc::clone(&shared), accept_partial_result)
+                .await
+                .unwrap();
+        }
+        let requests = server.service.requests.lock().unwrap();
+        for ((request, _, _), accepted) in requests.iter().zip([false, true, false]) {
+            assert_eq!(
+                request,
+                &if accepted {
+                    with_partial_result(build_insert_request())
+                } else {
+                    let mut expected = build_insert_request();
+                    expected.header.as_mut().unwrap().query_context = Some(Default::default());
+                    expected
+                }
+            );
+        }
+        assert_eq!(
+            shared.as_ref(),
+            &with_partial_result(build_insert_request())
+        );
+    }
+
+    #[tokio::test]
     async fn test_shared_request_can_be_resent_after_transport_error() {
         let server = RegionTestServer::start().await;
         let mut status = Status::unavailable("migrating");
@@ -758,12 +814,15 @@ mod tests {
             .push_back(Err(status));
         let requester = server.create_requester(ChannelConfig::default(), false, false);
         let shared = Arc::new(build_insert_request());
-        let error = requester.handle(Arc::clone(&shared)).await.unwrap_err();
+        let error = requester
+            .handle(Arc::clone(&shared), true)
+            .await
+            .unwrap_err();
         assert_eq!(error.retry_hint(), RetryHint::Retryable);
         assert!(
             matches!(error, Error::RegionServer { addr, code: tonic::Code::Unavailable, .. } if addr == server.addr)
         );
-        requester.handle(Arc::clone(&shared)).await.unwrap();
+        requester.handle(Arc::clone(&shared), true).await.unwrap();
         let requests = server.service.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, with_partial_result(shared.as_ref().clone()));
@@ -857,9 +916,12 @@ mod tests {
             assert_eq!(baseline.status_code(), StatusCode::RegionNotFound);
             assert_eq!(baseline.retry_hint(), hint);
             assert_eq!(baseline.tonic_code(), Some(tonic::Code::FailedPrecondition));
-            let owned = requester.handle(build_insert_request()).await.unwrap_err();
+            let owned = requester
+                .handle(build_insert_request(), true)
+                .await
+                .unwrap_err();
             let shared = requester
-                .handle(Arc::new(build_insert_request()))
+                .handle(Arc::new(build_insert_request()), true)
                 .await
                 .unwrap_err();
             for error in [owned, shared] {
@@ -868,7 +930,10 @@ mod tests {
                 assert_eq!(error.tonic_code(), baseline.tonic_code());
             }
             let datanode: &dyn Datanode = &requester;
-            let error = datanode.handle(build_insert_request()).await.unwrap_err();
+            let error = datanode
+                .handle_request(Arc::new(build_insert_request()), true)
+                .await
+                .unwrap_err();
             assert_eq!(error.status_code(), StatusCode::RegionNotFound);
             assert_eq!(error.retry_hint(), hint);
             assert!(matches!(error, meta_error::Error::External { .. }));
@@ -938,10 +1003,16 @@ mod tests {
                     body: Some(body),
                 };
                 let shared = Arc::new(request);
-                let shared_error = datanode.handle(Arc::clone(&shared)).await.unwrap_err();
+                let shared_error = datanode
+                    .handle_request(Arc::clone(&shared), true)
+                    .await
+                    .unwrap_err();
                 assert_eq!(Arc::strong_count(&shared), 1);
                 let request = Arc::try_unwrap(shared).unwrap();
-                let owned_error = datanode.handle(request).await.unwrap_err();
+                let owned_error = datanode
+                    .handle_request(Arc::new(request), true)
+                    .await
+                    .unwrap_err();
                 for error in [owned_error, shared_error] {
                     assert_eq!(
                         error.retry_hint(),
@@ -980,11 +1051,14 @@ mod tests {
         let requester = server.create_requester(ChannelConfig::default(), false, false);
         let shared = Arc::new(build_insert_request());
         assert!(matches!(
-            requester.handle(Arc::clone(&shared)).await.unwrap_err(),
+            requester
+                .handle(Arc::clone(&shared), true)
+                .await
+                .unwrap_err(),
             Error::IllegalDatabaseResponse { .. }
         ));
         assert!(matches!(
-            requester.handle(shared).await.unwrap_err(),
+            requester.handle(shared, true).await.unwrap_err(),
             Error::Server {
                 code: StatusCode::RegionNotFound,
                 ..
@@ -1024,7 +1098,10 @@ mod tests {
                 );
             }
             let requester = server.create_requester(config, false, false);
-            let error = requester.handle(Arc::clone(&shared)).await.unwrap_err();
+            let error = requester
+                .handle(Arc::clone(&shared), true)
+                .await
+                .unwrap_err();
             assert_eq!(
                 error.tonic_code(),
                 baseline.tonic_code(),
@@ -1049,7 +1126,7 @@ mod tests {
             );
         }
         let requester = server.create_requester(ChannelConfig::default(), false, false);
-        requester.handle(shared).await.unwrap();
+        requester.handle(shared, true).await.unwrap();
     }
 
     #[tokio::test]
@@ -1070,18 +1147,24 @@ mod tests {
             ..Default::default()
         };
 
-        requester.handle(inserts()).await.unwrap();
-        send_only_requester.handle(inserts()).await.unwrap();
-        accept_only_requester.handle(inserts()).await.unwrap();
-        requester.handle(bulk_insert()).await.unwrap();
-        disabled_requester.handle(bulk_insert()).await.unwrap();
+        requester.handle(inserts(), true).await.unwrap();
+        send_only_requester.handle(inserts(), true).await.unwrap();
+        accept_only_requester.handle(inserts(), true).await.unwrap();
+        requester.handle(bulk_insert(), true).await.unwrap();
+        disabled_requester
+            .handle(bulk_insert(), true)
+            .await
+            .unwrap();
         requester
-            .handle(build_remote_dyn_filter_unregister_request(
-                "query-1",
-                RemoteDynFilterUnregister {
-                    filter_id: "filter-1".to_string(),
-                },
-            ))
+            .handle(
+                build_remote_dyn_filter_unregister_request(
+                    "query-1",
+                    RemoteDynFilterUnregister {
+                        filter_id: "filter-1".to_string(),
+                    },
+                ),
+                true,
+            )
             .await
             .unwrap();
 
@@ -1234,7 +1317,7 @@ mod tests {
                     failures,
                     ..Default::default()
                 }));
-            let response = requester.handle_inner(Arc::clone(&request)).await;
+            let response = requester.handle_inner(Arc::clone(&request), true).await;
             if valid {
                 if has_error {
                     let error = response.unwrap_err();
@@ -1403,7 +1486,7 @@ mod tests {
                 .unwrap()
                 .push_back(Err(status));
             let error = requester
-                .handle_inner(Arc::clone(&request))
+                .handle_inner(Arc::clone(&request), true)
                 .await
                 .unwrap_err();
             assert!(matches!(error, Error::RegionServer { code: actual, .. } if actual == code));

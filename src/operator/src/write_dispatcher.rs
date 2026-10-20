@@ -297,7 +297,10 @@ impl WriteRetry {
     async fn send(&self, write: RoutedWrite, histogram: Option<&Histogram>) -> WriteAttempt {
         let _timer = histogram.map(Histogram::start_timer);
         let requester = self.node_manager.datanode(&write.peer).await;
-        match requester.handle(Arc::clone(&write.request)).await {
+        match requester
+            .handle_request(Arc::clone(&write.request), true)
+            .await
+        {
             Ok(response) => WriteAttempt::Success(response),
             Err(error) => {
                 let request = error.retry_hint().is_retryable().then_some(write);

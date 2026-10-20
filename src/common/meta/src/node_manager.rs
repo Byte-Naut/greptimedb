@@ -27,20 +27,26 @@ use crate::peer::Peer;
 /// The trait for handling requests to datanode.
 #[async_trait::async_trait]
 pub trait Datanode: Send + Sync {
-    /// Handles DML, and DDL requests.
-    async fn handle_request(&self, request: Arc<RegionRequest>) -> Result<RegionResponse>;
+    /// Handles DML and DDL requests.
+    ///
+    /// Callers accepting partial write results must inspect the failed entries before retrying.
+    async fn handle_request(
+        &self,
+        request: Arc<RegionRequest>,
+        accept_partial_result: bool,
+    ) -> Result<RegionResponse>;
 
     /// Handles query requests
     async fn handle_query(&self, request: QueryRequest) -> Result<SendableRecordBatchStream>;
 }
 
 impl dyn Datanode + '_ {
-    /// Handles an owned or shared request without cloning its payload.
+    /// Handles an owned or shared request without accepting partial write results.
     pub async fn handle<R>(&self, request: R) -> Result<RegionResponse>
     where
         R: Into<Arc<RegionRequest>> + Send,
     {
-        self.handle_request(request.into()).await
+        self.handle_request(request.into(), false).await
     }
 }
 

@@ -3684,6 +3684,7 @@ mod tests {
         async fn handle_request(
             &self,
             _request: Arc<api::v1::region::RegionRequest>,
+            _accept_partial_result: bool,
         ) -> common_meta::error::Result<api::region::RegionResponse> {
             let rows = match _request.body.as_ref() {
                 Some(api::v1::region::region_request::Body::Inserts(requests)) => requests

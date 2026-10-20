@@ -196,6 +196,7 @@ mod tests {
         async fn handle_request(
             &self,
             request: Arc<RegionRequest>,
+            _accept_partial_result: bool,
         ) -> common_meta::error::Result<RegionResponse> {
             self.requests.lock().unwrap().push(request.as_ref().clone());
             match Self::command(&request) {
@@ -341,6 +342,7 @@ mod tests {
             async fn handle_request(
                 &self,
                 _: Arc<RegionRequest>,
+                _accept_partial_result: bool,
             ) -> common_meta::error::Result<RegionResponse> {
                 Ok(RegionResponse::new(0))
             }

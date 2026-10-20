@@ -111,7 +111,11 @@ struct MockNode<T> {
 
 #[async_trait::async_trait]
 impl<T: MockDatanodeHandler> Datanode for MockNode<T> {
-    async fn handle_request(&self, request: Arc<RegionRequest>) -> Result<RegionResponse> {
+    async fn handle_request(
+        &self,
+        request: Arc<RegionRequest>,
+        _accept_partial_result: bool,
+    ) -> Result<RegionResponse> {
         let request = Arc::try_unwrap(request).expect("mock request must be exclusively owned");
         self.handler.handle(&self.peer, request).await
     }

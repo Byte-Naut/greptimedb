@@ -435,7 +435,7 @@ impl ScanRegion {
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     pub(crate) async fn unordered_scan(self) -> Result<UnorderedScan> {
         let input = self.scan_input().await?;
-        Ok(UnorderedScan::new(input))
+        Ok(UnorderedScan::new(input).await)
     }
 
     /// Scans by series.
@@ -1990,9 +1990,9 @@ impl StreamContext {
     }
 
     /// Creates a new [StreamContext] for [UnorderedScan].
-    pub(crate) fn unordered_scan_ctx(input: ScanInput) -> Self {
+    pub(crate) async fn unordered_scan_ctx(input: ScanInput) -> Self {
         let query_start = input.query_start.unwrap_or_else(Instant::now);
-        let ranges = RangeMeta::unordered_scan_ranges(&input);
+        let ranges = RangeMeta::unordered_scan_ranges(&input).await;
         READ_SST_COUNT.observe(input.num_files() as f64);
         Self {
             input,
